@@ -1,0 +1,502 @@
+package core
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"math"
+
+	"github.com/hdt3213/rdb/model"
+)
+
+/*
+	if hlen <= ZIPMAP_VALUE_MAX_FREE
+*/
+
+func (dec *Decoder) readHashMap() (map[string][]byte, error) {
+	size, _, err := dec.readLength()
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string][]byte)
+	for i := 0; i < int(size); i++ {
+		field, err := dec.readString()
+		if err != nil {
+			return nil, err
+		}
+		value, err := dec.readString()
+		if err != nil {
+			return nil, err
+		}
+		m[unsafeBytes2Str(field)] = value
+	}
+	return m, nil
+}
+
+// readHashMapEx reads hash with field-level expiration for Redis 7.4+ (typeHashWithHfe / typeHashWithHfeRc).
+// rc=true for 7.4 RC format (absolute TTL, no minExpire header), rc=false for 7.4 GA format (relative TTL with minExpire header).
+func (dec *Decoder) readHashMapEx(rc bool) (map[string][]byte, map[string]int64, error) {
+	var minExpire int64 = EB_EXPIRE_TIME_INVALID
+	var expire int64
+	if !rc {
+		// Hash with HFEs. min TTL at start (7.4+), 7.4RC not included
+		min, err := dec.readInt64()
+		if err != nil {
+			return nil, nil, err
+		}
+		if min > EB_EXPIRE_TIME_INVALID {
+			return nil, nil, fmt.Errorf("hash read invalid minExpire value: %d", min)
+		}
+		minExpire = min
+	}
+	size, _, err := dec.readLength()
+	if err != nil {
+		return nil, nil, err
+	} else if size == 0 {
+		return nil, nil, fmt.Errorf("hash read empty key")
+	}
+	m := make(map[string][]byte)
+	e := make(map[string]int64)
+	for i := 0; i < int(size); i++ {
+		ttl, _, err := dec.readLength()
+		if err != nil {
+			return nil, nil, err
+		}
+		if rc {
+			// Value is absolute for 7.4RC
+			expire = int64(ttl)
+		} else if ttl == 0 {
+			// 0 Indicates no TTL. This is common case so we keep it small.
+			expire = 0
+		} else {
+			// TTL is relative to minExpire (with +1 to avoid 0 that already taken)
+			expire = int64(ttl) + minExpire - 1
+		}
+		if expire > EB_EXPIRE_TIME_MAX {
+			return nil, nil, fmt.Errorf("invalid expireAt time: %d", expire)
+		}
+		field, err := dec.readString()
+		if err != nil {
+			return nil, nil, err
+		}
+		value, err := dec.readString()
+		if err != nil {
+			return nil, nil, err
+		}
+		m[unsafeBytes2Str(field)] = value
+		e[unsafeBytes2Str(field)] = expire
+	}
+	return m, e, nil
+}
+
+// readHashMapExValkey reads hash with field-level expiration for Valkey 9+ (typeHash2).
+// Valkey stores absolute expiration timestamps as int64 after each field-value pair.
+// -1 (or negative) means no TTL, which is normalized to 0.
+func (dec *Decoder) readHashMapExValkey() (map[string][]byte, map[string]int64, error) {
+	size, _, err := dec.readLength()
+	if err != nil {
+		return nil, nil, err
+	} else if size == 0 {
+		return nil, nil, fmt.Errorf("hash read empty key")
+	}
+	m := make(map[string][]byte)
+	e := make(map[string]int64)
+	for i := 0; i < int(size); i++ {
+		field, err := dec.readString()
+		if err != nil {
+			return nil, nil, err
+		}
+		value, err := dec.readString()
+		if err != nil {
+			return nil, nil, err
+		}
+		expire, err := dec.readInt64()
+		if err != nil {
+			return nil, nil, err
+		}
+		if expire < 0 {
+			expire = 0 // valkey uses -1 to indicate no TTL
+		}
+		m[unsafeBytes2Str(field)] = value
+		e[unsafeBytes2Str(field)] = expire
+	}
+	return m, e, nil
+}
+
+func (dec *Decoder) readZipMapHash() (map[string][]byte, error) {
+	buf, err := dec.readString()
+	if err != nil {
+		return nil, err
+	}
+	cursor := 0
+	bLen, err := readByte(buf, &cursor)
+	if err != nil {
+		return nil, err
+	}
+	length := int(bLen)
+	if bLen > 254 {
+		//todo: scan once
+		cursor0 := cursor // record current cursor
+		length, err = countZipMapEntries(buf, &cursor)
+		if err != nil {
+			return nil, err
+		}
+		length /= 2
+		cursor = cursor0 // recover cursor at begin position of first zip map entry
+	}
+	m := make(map[string][]byte)
+	for i := 0; i < length; i++ {
+		fieldB, err := readZipMapEntry(buf, &cursor, false)
+		if err != nil {
+			return nil, err
+		}
+		field := unsafeBytes2Str(fieldB)
+		value, err := readZipMapEntry(buf, &cursor, true)
+		if err != nil {
+			return nil, err
+		}
+		m[field] = value
+	}
+	return m, nil
+}
+
+// return: len, free, error
+func readZipMapEntryLen(buf []byte, cursor *int, readFree bool) (int, int, error) {
+	b, err := readByte(buf, cursor)
+	if err != nil {
+		return 0, 0, err
+	}
+	switch b {
+	case 253:
+		bs, err := readBytes(buf, cursor, 5)
+		if err != nil {
+			return 0, 0, err
+		}
+		length := int(binary.BigEndian.Uint32(bs))
+		free := int(bs[4])
+		return length, free, nil
+	case 254:
+		return 0, 0, errors.New("illegal zip map item length")
+	case 255:
+		return -1, 0, nil
+	default:
+		var free byte
+		if readFree {
+			free, err = readByte(buf, cursor)
+		}
+		return int(b), int(free), err
+	}
+}
+
+func readZipMapEntry(buf []byte, cursor *int, readFree bool) ([]byte, error) {
+	length, free, err := readZipMapEntryLen(buf, cursor, readFree)
+	if err != nil {
+		return nil, err
+	}
+	if length == -1 {
+		return nil, nil
+	}
+	value, err := readBytes(buf, cursor, length)
+	if err != nil {
+		return nil, err
+	}
+	*cursor += free // skip free bytes
+	return value, nil
+}
+
+func countZipMapEntries(buf []byte, cursor *int) (int, error) {
+	n := 0
+	for {
+		readFree := n%2 != 0
+		length, free, err := readZipMapEntryLen(buf, cursor, readFree)
+		if err != nil {
+			return 0, err
+		}
+		if length == -1 {
+			break
+		}
+		*cursor += length + free
+		n++
+	}
+	*cursor = 0 // reset cursor
+	return n, nil
+}
+
+func (dec *Decoder) readZipListHash() (map[string][]byte, *model.ZiplistDetail, error) {
+	buf, err := dec.readString()
+	if err != nil {
+		return nil, nil, err
+	}
+	cursor := 0
+	size := readZipListLength(buf, &cursor)
+	m := make(map[string][]byte)
+	for i := 0; i < size; i += 2 {
+		key, err := dec.readZipListEntry(buf, &cursor)
+		if err != nil {
+			return nil, nil, err
+		}
+		val, err := dec.readZipListEntry(buf, &cursor)
+		if err != nil {
+			return nil, nil, err
+		}
+		m[unsafeBytes2Str(key)] = val
+	}
+	detail := &model.ZiplistDetail{
+		RawStringSize: len(buf),
+	}
+	return m, detail, nil
+}
+
+func (dec *Decoder) readListPackHash() (map[string][]byte, *model.ListpackDetail, error) {
+	buf, err := dec.readString()
+	if err != nil {
+		return nil, nil, err
+	}
+	cursor := 0
+	size := readListPackLength(buf, &cursor)
+	m := make(map[string][]byte)
+	for i := 0; i < size; i += 2 {
+		key, err := dec.readListPackEntryAsString(buf, &cursor)
+		if err != nil {
+			return nil, nil, err
+		}
+		val, err := dec.readListPackEntryAsString(buf, &cursor)
+		if err != nil {
+			return nil, nil, err
+		}
+		m[unsafeBytes2Str(key)] = val
+	}
+	detail := &model.ListpackDetail{
+		RawStringSize: len(buf),
+	}
+	return m, detail, nil
+}
+
+func (dec *Decoder) readListPackHashEx(rc bool) (map[string][]byte, map[string]int64, *model.ListpackDetail, error) {
+	if !rc {
+		// This value was serialized for future use-case of streaming the object directly to FLASH (while keeping in mem its next expiration time)
+		_, err := dec.readInt64()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	buf, err := dec.readString()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	cursor := 0
+	size := readListPackLength(buf, &cursor)
+	if size == 0 {
+		return nil, nil, nil, fmt.Errorf("hash listpack read empty key")
+	} else if size%3 != 0 {
+		return nil, nil, nil, fmt.Errorf("hash listpack read invalid size %d", size)
+	}
+	m := make(map[string][]byte)
+	e := make(map[string]int64)
+	for i := 0; i < size; i += 3 {
+		key, err := dec.readListPackEntryAsString(buf, &cursor)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		val, err := dec.readListPackEntryAsString(buf, &cursor)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		expire, err := dec.readListPackEntryAsInt(buf, &cursor)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		m[unsafeBytes2Str(key)] = val
+		e[unsafeBytes2Str(key)] = expire
+	}
+	detail := &model.ListpackDetail{
+		RawStringSize: len(buf),
+	}
+	return m, e, detail, nil
+}
+
+func (enc *Encoder) WriteHashMapObject(key string, hash map[string][]byte, options ...interface{}) error {
+	err := enc.beforeWriteObject(options...)
+	if err != nil {
+		return err
+	}
+	ok, err := enc.tryWriteZipListHashMap(key, hash, options...)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		err = enc.writeHashEncoding(key, hash, options...)
+		if err != nil {
+			return err
+		}
+	}
+	enc.state = writtenObjectState
+	return nil
+}
+
+func (enc *Encoder) WriteHashMapObjectEx(key string, hash map[string][]byte, expire map[string]int64, options ...interface{}) error {
+	err := enc.beforeWriteObject(options...)
+	if err != nil {
+		return err
+	}
+
+	if enc.valkey {
+		err = enc.writeHash2Encoding(key, hash, expire, options...)
+	} else {
+		err = enc.writeHashEncodingEx(key, hash, expire, options...)
+	}
+	if err != nil {
+		return err
+	}
+	enc.state = writtenObjectState
+	return nil
+}
+
+func (enc *Encoder) writeHashEncoding(key string, hash map[string][]byte, options ...interface{}) error {
+	err := enc.write([]byte{typeHash})
+	if err != nil {
+		return err
+	}
+	err = enc.writeString(key)
+	if err != nil {
+		return err
+	}
+	err = enc.writeLength(uint64(len(hash)))
+	if err != nil {
+		return err
+	}
+	for field, value := range hash {
+		err = enc.writeString(field)
+		if err != nil {
+			return err
+		}
+		err = enc.writeString(unsafeBytes2Str(value))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (enc *Encoder) writeHashEncodingEx(key string, hash map[string][]byte, expire map[string]int64, options ...interface{}) error {
+	err := enc.write([]byte{typeHashWithHfe})
+	if err != nil {
+		return err
+	}
+	err = enc.writeString(key)
+	if err != nil {
+		return err
+	}
+	// Hash with HFEs. min TTL at start (7.4+), 7.4RC not included
+	// minExpire is the minimum non-zero expiration time across all fields,
+	// used as a base for relative TTL encoding. Matches Redis hashTypeGetMinExpire().
+	var minExpire int64 = EB_EXPIRE_TIME_INVALID
+	for _, e := range expire {
+		if e > 0 && e < minExpire {
+			minExpire = e
+		}
+	}
+	if minExpire == EB_EXPIRE_TIME_INVALID {
+		// No field has expiration, use 0
+		minExpire = 0
+	}
+	minExpireBytes := make([]byte, 8)
+	binary.LittleEndian.PutUint64(minExpireBytes[:], uint64(minExpire))
+	err = enc.write(minExpireBytes)
+	if err != nil {
+		return err
+	}
+	err = enc.writeLength(uint64(len(hash)))
+	if err != nil {
+		return err
+	}
+	for field, value := range hash {
+		fieldExpire := expire[field]
+		var ttl uint64
+		if fieldExpire == 0 {
+			// 0 indicates no TTL
+			ttl = 0
+		} else {
+			// TTL is relative to minExpire (with +1 to avoid 0 that already taken)
+			ttl = uint64(fieldExpire - minExpire + 1)
+		}
+		err = enc.writeLength(ttl)
+		if err != nil {
+			return err
+		}
+		err = enc.writeString(field)
+		if err != nil {
+			return err
+		}
+		err = enc.writeString(unsafeBytes2Str(value))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (enc *Encoder) writeHash2Encoding(key string, hash map[string][]byte, expire map[string]int64, options ...interface{}) error {
+	ttl := make([]byte, 8)
+	err := enc.write([]byte{typeHash2})
+	if err != nil {
+		return err
+	}
+	err = enc.writeString(key)
+	if err != nil {
+		return err
+	}
+	err = enc.writeLength(uint64(len(hash)))
+	if err != nil {
+		return err
+	}
+	for field, value := range hash {
+		err = enc.writeString(field)
+		if err != nil {
+			return err
+		}
+		err = enc.writeString(unsafeBytes2Str(value))
+		if err != nil {
+			return err
+		}
+		if expire[field] == 0 {
+			binary.LittleEndian.PutUint64(ttl, math.MaxUint64) // -1 means no TTL
+		} else {
+			binary.LittleEndian.PutUint64(ttl, uint64(expire[field]))
+		}
+		err = enc.write(ttl)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (enc *Encoder) tryWriteZipListHashMap(key string, hash map[string][]byte, options ...interface{}) (bool, error) {
+	if len(hash) > enc.hashZipListOpt.getMaxEntries() {
+		return false, nil
+	}
+	maxValue := enc.hashZipListOpt.getMaxValue()
+	for _, v := range hash {
+		if len(v) > maxValue {
+			return false, nil
+		}
+	}
+	err := enc.write([]byte{typeHashZipList})
+	if err != nil {
+		return true, err
+	}
+	err = enc.writeString(key)
+	if err != nil {
+		return true, err
+	}
+	entries := make([]string, 0, len(hash)*2)
+	for k, v := range hash {
+		entries = append(entries, k, unsafeBytes2Str(v))
+	}
+	err = enc.writeZipList(entries)
+	if err != nil {
+		return true, err
+	}
+	return true, nil
+}

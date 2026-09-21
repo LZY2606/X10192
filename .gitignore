@@ -1,0 +1,57 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+.idea
+target
+large.rdb
+/large.aof
+/large.json
+
+# --- 依赖与构建产物（不进交付快照）---
+node_modules/
+bower_components/
+.pnp.*
+dist/
+build/
+out/
+target/
+.next/
+.nuxt/
+.svelte-kit/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+vendor/bundle/
+Pods/
+.gradle/
+.cargo/
+.DS_Store
+.env
+.env.*
+*.log
+coverage/
+.coverage
+.nyc_output/
+.cache/
+.parcel-cache/
+.vite/
+.turbo/
+*.tsbuildinfo
