@@ -57,6 +57,11 @@ const (
 	QuickList2Encoding = "quicklist2"
 )
 
+const (
+	SecondExpiration      = "seconds"
+	MillisecondExpiration = "milliseconds"
+)
+
 // CallbackFunc process redis object
 type CallbackFunc func(object RedisObject) bool
 
@@ -92,12 +97,14 @@ type BaseObject struct {
 	DB         int         `json:"db"`                   // DB is db index of redis object
 	Key        string      `json:"key"`                  // Key is key of redis object
 	Expiration *time.Time  `json:"expiration,omitempty"` // Expiration is expiration time, expiration of persistent object is nil
+	ExpireUnit string      `json:"-"`                    // ExpireUnit is seconds or milliseconds
 	Size       int         `json:"size"`                 // Size is rdb value size in Byte
 	Type       string      `json:"type"`                 // Type is one of string/list/set/hash/zset
 	Encoding   string      `json:"encoding"`             // Encoding is the exact encoding method
 	Extra      interface{} `json:"-"`                    // Extra stores more detail of encoding for memory profiler and other usages
 	IdleTime   *int64      `json:"lru,omitempty"`
 	Freq       *int64      `json:"lfu,omitempty"`
+	ByteOffset int64       `json:"-"`
 }
 
 // GetKey returns key of object

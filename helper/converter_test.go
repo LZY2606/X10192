@@ -133,7 +133,6 @@ func TestToJson(t *testing.T) {
 	}
 }
 
-
 func TestToJsonWithGlobalMeta(t *testing.T) {
 	// SortMapKeys will cause performance losses, only enabled during test
 	jsonEncoder = sonic.ConfigStd
@@ -195,7 +194,7 @@ func TestToJsonWithRegex(t *testing.T) {
 	srcRdb := filepath.Join("../cases", "memory.rdb")
 	actualJSON := filepath.Join("tmp", "memory_regex.json")
 	expectJSON := filepath.Join("../cases", "memory_regex.json")
-	err = ToJsons(srcRdb, actualJSON, WithRegexOption("^l.*"))
+	err = ToJsons(srcRdb, actualJSON, WithRegexOption("^l.*"), WithConcurrent(1))
 	if err != nil {
 		t.Errorf("error occurs during parse, err: %v", err)
 		return
@@ -210,7 +209,7 @@ func TestToJsonWithRegex(t *testing.T) {
 		return
 	}
 	errJson := filepath.Join("tmp", "memory_regex_err.json")
-	err = ToJsons(srcRdb, errJson, WithRegexOption(`(i)\1`))
+	err = ToJsons(srcRdb, errJson, WithRegexOption(`(i)\1`), WithConcurrent(1))
 	if err == nil {
 		t.Error("expect error")
 	}

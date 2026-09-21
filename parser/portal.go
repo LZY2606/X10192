@@ -4,6 +4,7 @@ package parser
 import (
 	"github.com/hdt3213/rdb/core"
 	"github.com/hdt3213/rdb/model"
+	"github.com/hdt3213/rdb/restore"
 )
 
 const (
@@ -43,10 +44,24 @@ type (
 	// AuxObject stores redis metadata
 	AuxObject = model.AuxObject
 	// DBSizeObject stores db size metadata
-	DBSizeObject = model.DBSizeObject
+	DBSizeObject   = model.DBSizeObject
+	RestorePlan    = restore.RestorePlan
+	PlanItem       = restore.PlanItem
+	PlannedCommand = restore.PlannedCommand
+	RestoreOptions = restore.Options
+	RestoreEvent   = restore.Event
 )
 
 var (
 	// NewDecoder creates a new RDB decoder
 	NewDecoder = core.NewDecoder
+
+	NewRestorePlanner = restore.NewPlanner
+	PlanFromObjects   = restore.PlanFromObjects
+	PlanFromEvents    = restore.PlanFromEvents
+	Redis5Profile     = restore.Redis5Profile
+	Redis6Profile     = restore.Redis6Profile
+	Redis7Profile     = restore.Redis7Profile
+	Redis72Profile    = restore.Redis72Profile
+	Redis74Profile    = restore.Redis74Profile
 )

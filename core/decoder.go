@@ -386,9 +386,12 @@ func (dec *Decoder) readObject(flag byte, base *model.BaseObject) (model.RedisOb
 func (dec *Decoder) parse(cb func(object model.RedisObject) bool) error {
 	var dbIndex int
 	var expireMs int64
+	var expireUnit string
+	var objectOffset int64
 	var lru *int64
 	var lfu *int64
 	for {
+		objectOffset = int64(dec.readCount)
 		b, err := dec.readByte()
 		if err != nil {
 			return err
@@ -408,6 +411,7 @@ func (dec *Decoder) parse(cb func(object model.RedisObject) bool) error {
 				return err
 			}
 			expireMs = int64(binary.LittleEndian.Uint32(dec.buffer)) * 1000
+			expireUnit = model.SecondExpiration
 			continue
 		} else if b == opCodeExpireTimeMs {
 			err = dec.readFull(dec.buffer)
@@ -415,6 +419,7 @@ func (dec *Decoder) parse(cb func(object model.RedisObject) bool) error {
 				return err
 			}
 			expireMs = int64(binary.LittleEndian.Uint64(dec.buffer))
+			expireUnit = model.MillisecondExpiration
 			continue
 		} else if b == opCodeResizeDB {
 			keyCount, _, err := dec.readLength()
@@ -558,13 +563,16 @@ func (dec *Decoder) parse(cb func(object model.RedisObject) bool) error {
 			return err
 		}
 		base := &model.BaseObject{
-			DB:  dbIndex,
-			Key: unsafeBytes2Str(key),
+			DB:         dbIndex,
+			Key:        unsafeBytes2Str(key),
+			ByteOffset: objectOffset,
 		}
 		if expireMs > 0 {
 			expiration := time.Unix(0, expireMs*int64(time.Millisecond))
 			base.Expiration = &expiration
+			base.ExpireUnit = expireUnit
 			expireMs = 0 // reset expire ms
+			expireUnit = ""
 		}
 		base.IdleTime = lru
 		lru = nil // reset lru
